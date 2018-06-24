@@ -1,16 +1,16 @@
 const Discord  = require('discord.js');
 const ytdl     = require("ytdl-core");
 const fs 	   = require("fs");
+const tools    = require("./lib/tools.js");
 const usercmds = require("./lib/commands.js");
+
+var config = JSON.parse(fs.readFileSync("settings.json", "utf-8"));
 
 const client = new Discord.Client();
 
-var config = JSON.parse(fs.readFileSync("settings.json", "utf-8"));
-const discord_token = config.discord_token;
-
 /* -------------------------------------------------- */
 
-client.login(discord_token);
+client.login(config.token);
 
 client.on('message', msg => {
 
@@ -33,9 +33,9 @@ client.on('message', msg => {
 			if (ytdl.validateURL(msg.content)){
 
 				let stream = ytdl(msg.content, {filter: 'audioonly'});
-				let time = decodeURL(msg.content, "t");
-				let seek = time ? {seek: convertTime(time)} : {};
-				addActionToQueue({msg: msg, song: {stream: stream, seek: seek}});
+				let time = tools.decodeURL(msg.content, "t");
+				let seek = time ? {seek: tools.convertTime(time)} : {};
+				pushAction({msg: msg, song: {stream: stream, seek: seek}});
 
 			} else {
 				console.log('URL non valide : ' + msg.content);
@@ -43,7 +43,7 @@ client.on('message', msg => {
 
 		} else if (msg.content == "help"){
 
-			addActionToQueue({msg: msg, song: "rick/rick06.mp3", text: Object.keys(usercmds).sort().join(" ")});
+			pushAction({msg: msg, song: "rick/rick06.mp3", text: Object.keys(usercmds).sort().join(" ")});
 
 		} else if (msg.content == "tg"){
 
@@ -75,18 +75,19 @@ client.on('message', msg => {
 
 let actionsQueue = [];
 
-function executeAction(){
+async function executeAction(){
 	if (actionsQueue.length == 0) return;
 	let action = actionsQueue[0];
-	Promise.all([play(action.msg, action.song), talk(action.msg, action.text)]).then(executeNextAction, executeNextAction);
-}
-
-function executeNextAction(log){
+	try {
+		await Promise.all([talk(action.msg, action.text), play(action.msg, action.song)]);
+	} catch(error) {
+		console.log(error);
+	}
 	actionsQueue.shift();
 	executeAction();
 }
 
-function addActionToQueue(action){
+function pushAction(action){
 	actionsQueue.push(action);
 	if (actionsQueue.length == 1) executeAction();
 }
@@ -108,101 +109,65 @@ function executeCommand(msg, cmd){
 	}
 
 	if (cmd.userLocked && cmd.userLocked[msg.author.id]) executeCommand(msg, cmd.userLocked[msg.author.id]);
-	else addActionToQueue({msg: msg, song: cmd.song, text: cmd.message});
+	else pushAction({msg: msg, song: cmd.song, text: cmd.message});
 
 }
 
 /* -------------------------------------------------- */
 
-function play(msg, song){
+async function connect(msg){
 
-	return new Promise((resolve, reject) => {
+	if (!msg.guild.voiceConnection){
 
-		if (!song) resolve('You need to specify something !');
-
-		if (!msg.guild.voiceConnection){
-
-			if (!msg.member.voiceChannelID) resolve('Join a voicechannel first !');
+		if (!msg.member.voiceChannelID) throw new Error("Join a voicechannel first !");
 
 			const voiceChannel = msg.guild.channels.get(msg.member.voiceChannelID), userID = client.user.id;
 
-			if (!voiceChannel.permissionsFor(userID).has('CONNECT')) resolve('This channel doesn\'t allow me to connect !');
+			if (!voiceChannel.permissionsFor(userID).has('CONNECT')) throw new Error("This channel doesn't allow me to connect !");
 
-			if (!voiceChannel.permissionsFor(userID).has('SPEAK'))   resolve('This channel doesn\'t allow me to speak !');
+			if (!voiceChannel.permissionsFor(userID).has('SPEAK'))   throw new Error("This channel doesn't allow me to speak !");
 
-			voiceChannel.join().then(connection => {
-				play(msg, song).then(() => {resolve();}, () => {resolve();});
-			});
+			await voiceChannel.join();
 
-		} else if (msg.member.voiceChannelID !== msg.guild.voiceConnection.channel.id) resolve('Join my voicechannel !');
+	 } else if (msg.member.voiceChannelID !== msg.guild.voiceConnection.channel.id) throw new Error("Join my voicechannel !");
+
+}
+
+async function play(msg, song){
+
+	if (!song) throw new Error("You need to specify something !");
+
+	await connect(msg);
+
+	const voiceConnection = msg.guild.voiceConnection;
 		
-		else {
+	if (voiceConnection.speaking) voiceConnection.dispatcher.end();
 			
-			const voiceConnection = msg.guild.voiceConnection;
+	let dispatcher = typeof song == "object" ? voiceConnection.playStream(song.stream, song.seek) : voiceConnection.playFile('./music/' + song);
 
-			if (voiceConnection.speaking) voiceConnection.dispatcher.end();
-			
-			let dispatcher = null;
-			if (typeof song == "object"){
-				dispatcher = voiceConnection.playStream(song.stream, song.seek);
-			} else {
-				console.log(song);
-				dispatcher = voiceConnection.playFile('./music/' + song);
-			}
-
-			dispatcher.on('end', data => {
-				if (data == "stream" || data == "Stream is not generating quickly enough."){
-					voiceConnection.on('disconnect', () => {resolve();})
-					voiceConnection.disconnect();
-				} else {
-					resolve();
-				}
-			});
-
-		}
-
-	});
+	await disconnect(msg);
 	
 }
 
-function talk(msg, text){
-	
+async function disconnect(msg){
+
 	return new Promise((resolve, reject) => {
-		if (!text){
-			resolve('You need to specify something !');
-		} else {
-			console.log(text);
-			msg.channel.send(text).then(() => {resolve();}, () => {resolve();});
-		}
+		const voiceConnection = msg.guild.voiceConnection;
+		voiceConnection.dispatcher.on('end', data => {
+			if (data == "stream" || data == "Stream is not generating quickly enough."){
+				voiceConnection.on('disconnect', () => {resolve();})
+				voiceConnection.disconnect();
+			} else {
+				resolve();
+			}
+		});
 	});
 
 }
 
-/* -------------------------------------------------- */
-
-function decodeURL(url, tag){
-
-	tag = tag.replace(/[\[\]]/g, "\\$&");
+async function talk(msg, text){
 	
-	let regexp = new RegExp("[?&]" + tag + "(=([^&#]*)|&|#|$)"), results = regexp.exec(url);
-	
-	if (results === null) return null;
-	
-	return decodeURIComponent(results[2].replace(/\+/g, " "));
+	if (!text) return;
+	msg.channel.send(text);
 
-}
-
-function convertTime(time){
-
-	let timeUnits = {s: 1, m: 60, h: 3600};
-
-	let total = 0;
-	let regexp = /(\d+)(ms|s|m|h)/g;
-	let results;
-
-	while ((results = regexp.exec(time)) !== null){
-		total = total + results[1] * timeUnits[results[2]];
-	}
-	
-	return total;
 }
